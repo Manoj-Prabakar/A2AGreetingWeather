@@ -1,0 +1,38 @@
+async def execute(
+    self,
+    context: RequestContext,
+    event_queue: EventQueue,
+):
+    """
+    Handles send_message_streaming (real-time) requests for the Weather Agent.
+    Each 'yield Event(...)' in WeatherAgent.run() is streamed to the client immediately.
+    """
+    if not context.task_id or not context.context_id:
+        raise ValueError("RequestContext must have task_id and context_id")
+    if not context.message:
+        raise ValueError("RequestContext must have a message")
+
+    task_updater = TaskUpdater(event_queue, context.task_id, context.context_id)
+
+    # Start tracking the task lifecycle
+    if not context.current_task:
+        task_updater.submit()
+    task_updater.start_work()
+
+    try:
+        # 🔁 Stream each event from the ADK agent as it is generated
+        async for event in self.runner.run_async(
+            session_id=context.context_id,
+            content=types.Content(
+                parts=convert_a2a_parts_to_genai(context.message.parts)
+            ),
+        ):
+            # Push each event into the event queue immediately
+            await event_queue.put(event)
+
+        # ✅ Once all events are done, mark as complete
+        task_updater.complete()
+
+    except Exception as e:
+        logger.error(f"Error during streaming execution: {e}", exc_info=True)
+        task_updater.fail(message=str(e))
