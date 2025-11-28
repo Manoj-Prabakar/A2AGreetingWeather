@@ -1,0 +1,132 @@
+1️⃣ One-off utterance test using Sessions
+from dfcx_scrapi.core.sessions import Sessions
+
+# 1. Your CX agent resource name
+AGENT_ID = "projects/<PROJECT_ID>/locations/<LOCATION_ID>/agents/<AGENT_ID>"
+LANG_CODE = "en"  # or "en-US", "de", etc.
+
+# 2. Create Sessions client
+# If you're using `gcloud auth application-default login`, you can often omit creds_path
+sessions_client = Sessions(agent_id=AGENT_ID)  
+# or: sessions_client = Sessions(agent_id=AGENT_ID, creds_path="path/to/sa.json")
+
+# 3. Build a session id (one per conversation)
+session_id = sessions_client.build_session_id()
+
+def test_utterance(utterance: str):
+    """Send one utterance and print what CX thinks."""
+    # detect_intent is the main method mentioned in the release notes
+    response = sessions_client.detect_intent(
+        session_id=session_id,
+        text=utterance,
+        language_code=LANG_CODE,
+        # you *can* pass optional stuff like parameters=..., end_user_metadata=... in some versions
+    )
+
+    # Response is usually a dict-like structure; adapt based on what you see when you print it once
+    intent = response.get("intentDisplayName")
+    confidence = response.get("intentDetectionConfidence")
+    messages = response.get("responseMessages", [])
+
+    print(f"User: {utterance}")
+    print(f"Intent predicted: {intent} (conf={confidence:.2f})")
+
+    if messages:
+        # Often the first text response is here
+        try:
+            text_msg = messages[0]["text"]["text"][0]
+            print(f"Agent reply: {text_msg}")
+        except Exception:
+            print(f"Raw responseMessages: {messages}")
+
+    print("-" * 60)
+
+
+# 4. Try a few utterances
+test_utterance("hi")
+test_utterance("I want to book a flight")
+test_utterance("cancel my hotel booking")
+
+
+What’s happening:
+
+Sessions.build_session_id() → builds a valid session name (including env if configured). 
+GitHub
+
+Sessions.detect_intent(...) → wraps the Dialogflow CX detect_intent API and returns a dict-like response where you can read intentDisplayName, confidence, messages, etc. 
+GitHub
+
+2️⃣ Bulk utterance testing with expected intents
+
+If you want to evaluate NLU quality, you usually have a table like:
+
+utterance	expected_intent
+"hi"	Default Welcome
+"book a flight to Berlin"	BookFlight
+"cancel my reservation"	CancelBooking
+
+Here’s a simple script to loop through that and calculate accuracy:
+
+from dfcx_scrapi.core.sessions import Sessions
+
+AGENT_ID = "projects/<PROJECT_ID>/locations/<LOCATION_ID>/agents/<AGENT_ID>"
+LANG_CODE = "en"
+
+sessions_client = Sessions(agent_id=AGENT_ID)
+session_id = sessions_client.build_session_id()
+
+test_cases = [
+    {"utterance": "hi", "expected_intent": "Default Welcome"},
+    {"utterance": "book a flight to Berlin", "expected_intent": "BookFlight"},
+    {"utterance": "cancel my reservation", "expected_intent": "CancelBooking"},
+]
+
+correct = 0
+total = len(test_cases)
+
+for case in test_cases:
+    utt = case["utterance"]
+    expected = case["expected_intent"]
+
+    res = sessions_client.detect_intent(
+        session_id=session_id,
+        text=utt,
+        language_code=LANG_CODE,
+    )
+
+    predicted = res.get("intentDisplayName")
+    confidence = res.get("intentDetectionConfidence")
+
+    is_match = (predicted == expected)
+    if is_match:
+        correct += 1
+
+    print(f"Utterance: {utt}")
+    print(f"Expected intent : {expected}")
+    print(f"Predicted intent: {predicted} (conf={confidence:.2f}) -> {'✅' if is_match else '❌'}")
+    print("-" * 60)
+
+print(f"Accuracy: {correct}/{total} = {correct/total:.2%}")
+
+
+You can easily extend this to:
+
+Read test cases from a CSV / Google Sheet and feed them in.
+
+Save the results into a CSV for later analysis.
+
+Integrate with the Evaluations tools in dfcx-scrapi if you want more advanced metrics. 
+GitHub
+
+3️⃣ Using get_agent_answer (as seen in the GitHub issue)
+
+In some examples/notebooks, they simply do:
+
+from dfcx_scrapi.core.sessions import Sessions
+
+sessions_client = Sessions(agent_id=AGENT_ID)
+
+user_query = "Hello World!"
+answer = sessions_client.get_agent_answer(user_query)
+print("Q:", user_query)
+print("A:", answer)
