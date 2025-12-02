@@ -1,0 +1,25 @@
+from dfcx_scrapi.core.sessions import Sessions
+
+# The full resource name of your Dialogflow CX agent:
+# 'projects/<project_id>/locations/<location_id>/agents/<agent_id>'
+agent_path = '<YOUR_AGENT_ID>'
+
+# Initialize the Sessions client with your agent
+sessions_client = Sessions()
+
+# Start a new session for a conversation
+session = sessions_client.start_session(agent_path)
+
+# The user input utterance you want to test
+user_text = "Book a flight to New York"
+
+# Detect intent by sending the user text to the session
+response = sessions_client.detect_intent_text(agent_path, session, user_text)
+
+# Extract the detected intent display name from the response
+detected_intent = response.query_result.intent.display_name
+
+print(f"Detected Intent: {detected_intent}")
+
+# Optionally, delete the session after finish
+sessions_client.delete_session(agent_path, session)
