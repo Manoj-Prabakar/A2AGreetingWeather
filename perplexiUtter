@@ -1,0 +1,25 @@
+from dfcx_scrapi.core.conversation import Conversations
+
+# Your Dialogflow CX agent path in this format:
+# 'projects/<project_id>/locations/<location_id>/agents/<agent_id>'
+agent_id = '<YOUR_AGENT_ID>'
+
+# Initialize the Conversations class (uses environment creds or service account)
+conv = Conversations()
+
+# Start a new conversation with the agent
+conversation_id = conv.start_conversation(agent_id)
+
+# The user utterance you want to test
+user_utterance = "Book a flight to New York"
+
+# Send the user utterance to the agent and get the response
+response = conv.detect_intent(agent_id, conversation_id, user_utterance)
+
+# Extract the detected intent from the response
+detected_intent = response.query_result.intent.display_name
+
+print(f"Detected Intent: {detected_intent}")
+
+# End the conversation when done
+conv.delete_conversation(agent_id, conversation_id)
