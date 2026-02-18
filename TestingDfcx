@@ -1,0 +1,276 @@
+import pandas as pd
+import configparser
+import ast
+import json
+import re
+import numpy as np
+from dfcx_scrapi.core.conversation import DialogflowConversation
+
+# -----------------------------
+# Helpers: parse parameters_set / parameters
+# -----------------------------
+def parse_params_maybe_dict(value):
+    """
+    Try to parse 'parameters_set' or 'parameters' into a dict.
+    Accepts dict, JSON string, or Python-literal string; returns dict or None.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if s == "":
+            return None
+        # Try JSON first
+        try:
+            d = json.loads(s)
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+        # Fallback to Python literal
+        try:
+            d = ast.literal_eval(s)
+            if isinstance(d, dict):
+                return d
+        except (ValueError, SyntaxError):
+            return None
+    return None
+
+def first_nonempty_value(d):
+    """Return the first non-empty scalar/string value from dict d; else None."""
+    if not isinstance(d, dict) or not d:
+        return None
+    for v in d.values():
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        # Unwrap nested dicts like {"stringValue": "917891607"} if present
+        if isinstance(v, dict):
+            for iv in v.values():
+                if iv is None:
+                    continue
+                if isinstance(iv, str) and iv.strip() == "":
+                    continue
+                return iv
+            continue
+        return v
+    return None
+
+def normalize_text(x):
+    """Lowercase, trim, and remove spaces. Returns None for nulls."""
+    if x is None:
+        return None
+    return str(x).strip().lower().replace(" ", "")
+
+def normalize_entity_value(v, digits_only=True):
+    """
+    Normalize any parameter value to a compact string:
+    - If list/tuple, join elements.
+    - Convert to string, remove all whitespace.
+    - Optionally keep only digits (for numeric IDs like TIN/memberid).
+    """
+    if v is None:
+        return ""
+    if isinstance(v, (list, tuple)):
+        v = "".join(str(x) for x in v)
+    s = str(v)
+    s = re.sub(r"\s+", "", s)      # remove all whitespace
+    if digits_only:
+        s = re.sub(r"\D+", "", s)  # keep only digits
+    return s
+
+def ensure_text(x):
+    """Ensure utterance is a safe string."""
+    if x is None:
+        return ""
+    if not isinstance(x, str):
+        x = str(x)
+    return x.strip()
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    # Step 1: Load properties
+    config = configparser.ConfigParser()
+    config.read('config.properties')
+
+    # Step 2: Read values from property file
+    agent_id = config.get('dialogflow', 'agent_id')
+
+    excel_file = config.get('input', 'excel_file')
+    sheet_name = config.getint('input', 'sheet_name')
+    flow_display_name = config.get('input', 'flow_display_name')
+    page_display_name = config.get('input', 'page_display_name')
+    Utterances = config.get('input', 'Utterances')      # column name for utterances in input Excel
+    intent_column = config.get('input', 'intent_column')# column name for expected intent in input Excel
+
+    result_file = config.get('output', 'result_file')   # CSV path for dfcx results
+    #results_excel_file = "Results file.xlsx"            # final Excel output name
+    results_excel_file = (
+        config.get('output', 'results_excel_file')
+        if config.has_option('output', 'results_excel_file')
+        else "Results file.xlsx"
+    )
+
+
+    # Step 3: Create DialogflowConversation object
+    conversation = DialogflowConversation(agent_id=agent_id)
+
+    # Step 4: Read input Excel
+    df = pd.read_excel(excel_file, sheet_name=sheet_name, engine='openpyxl')
+
+    # Defensive: make sure required input columns exist
+    for col in [Utterances, intent_column]:
+        if col not in df.columns:
+            raise ValueError(
+                f"Input column '{col}' not found in sheet '{sheet_name}' of '{excel_file}'."
+            )
+
+    # Clean utterances to safe strings (prevents len(int) crash inside dfcx_scrapi)
+    df[Utterances] = (
+        df[Utterances]
+        #.astype(str)          # convert numbers to strings
+        .replace({'nan': ''}) # if astype created literal 'nan'
+        .fillna('')
+        .str.strip()
+    )
+
+    # Step 5: Prepare test set using values from properties
+    test_set = pd.DataFrame({
+        "flow_display_name": flow_display_name,
+        "page_display_name": page_display_name,
+        "utterance": df[Utterances].apply(ensure_text),
+        "inject_parameters": "iDOB",
+        "end_user_metadata": ""
+    })
+
+    # Optional: clamp overly long texts (protect against API limits)
+    max_len = 4000
+    test_set['utterance'] = test_set['utterance'].str.slice(0, max_len)
+
+    # Step 6: Run intent detection
+    # Arguments: (test_set, timeout_sec, max_workers) – adjust as needed
+    results = conversation.run_intent_detection(test_set, 100, 10)
+    results1 = conversation.df_one
+    print("Printing resuls1 DataFrame")
+    print(results1)
+
+    # Safety checks for returned columns
+    if 'detected_intent' not in results.columns:
+        raise ValueError(
+            "Column 'detected_intent' not found in results returned by run_intent_detection."
+        )
+    if 'confidence' not in results.columns:
+        raise ValueError(
+            "Column 'confidence' not found in results. Ensure your run_intent_detection returns confidence scores."
+        )
+
+    # -----------------------------
+    # Step 7: Intent match (gated by confidence)
+    # -----------------------------
+    # Add expected intent to results by order (both have same length)
+    results['expected_intent'] = df[intent_column].values
+
+    # IMPORTANT: normalize the index to avoid "cannot reindex on an axis with duplicate labels"
+    results = results.reset_index(drop=True)
+
+    # Compare strings first (normalize both sides)
+    string_match = (
+        results['expected_intent'].astype(str).apply(normalize_text) ==
+        results['detected_intent'].astype(str).apply(normalize_text)
+    )
+
+    # Robust confidence conversion (handles '', None, N/A, null)
+    results['confidence'] = results['confidence'].replace(
+        {'': np.nan, 'N/A': np.nan, 'None': np.nan, 'null': np.nan}
+    )
+    results['confidence'] = pd.to_numeric(results['confidence'], errors='coerce').fillna(0.0)
+
+    conf_ok = results['confidence'] >= 0.3
+
+    # Final intent_match = both must be true
+    results['intent_match'] = (string_match & conf_ok).astype(bool)
+    accuracy = float(results['intent_match'].mean() * 100)
+
+    # -----------------------------
+    # Step 7.1: Entity extraction + comparison
+    # -----------------------------
+    # Prefer raw 'parameters' over display-formatted 'parameters_set'
+    params_col = 'parameters' if 'parameters' in results.columns else (
+        'parameters_set' if 'parameters_set' in results.columns else None
+    )
+    if params_col is None:
+        # Keep schema consistent if parameters not returned
+        results['parameters'] = None
+        params_col = 'parameters'
+
+    
+    results['extracted_entity'] = results[params_col].apply(
+    lambda p: (
+        f"{str(int(p['extracted_dob']['month']))}{str(p['extracted_dob']['day']).zfill(2)}{str(p['extracted_dob']['year'])}"
+        if isinstance(p, dict) and 'extracted_dob' in p and all(k in p['extracted_dob'] for k in ('month', 'day', 'year'))
+        else None
+    )
+)
+
+
+
+
+    
+    def to_mddyyyy(d):
+        month = d['month'].lstrip('0')  # remove leading zero from month
+        day = d['day'].zfill(2)         # ensure day is 2 digits
+        year = d['year']                # assume already 4 digits
+        return f"{month}{day}{year}"
+
+
+    '''
+    # Extract first sensible value from returned parameters dict
+    results['extracted_entity_raw'] = results[params_col].apply(
+        lambda v: first_nonempty_value(parse_params_maybe_dict(v))
+    )
+
+    # Normalize the entity value (remove spaces; keep only digits for TIN/memberid-like values)
+    results['extracted_entity'] = results['extracted_entity_raw'].apply(
+        lambda x: normalize_entity_value(x, digits_only=True)
+    )
+    '''
+    
+  
+    # Entity comparison (normalized) and gate by confidence
+    entity_string_match = (
+        results['extracted_entity'].apply(normalize_text) ==
+        results['expected_intent'].apply(normalize_text)
+    )
+    results['entity_match'] = (entity_string_match & conf_ok).astype(bool)
+
+    # -----------------------------
+    # Step 7.2: Write back into the original input Excel schema
+    # -----------------------------
+    # Ensure the target columns exist (create if missing)
+    if 'Actual DoB' not in df.columns:
+        df['Actual DoB'] = ""
+    if 'Pass / Fail' not in df.columns:
+        df['Pass / Fail'] = ""
+
+    # Align by row order (since we reset index to RangeIndex)
+    df['Actual DoB'] = results['extracted_entity'].astype(str).values
+    df['Pass / Fail'] = np.where(results['entity_match'].values, 'Pass', 'Fail')
+
+    # -----------------------------
+    # Step 8: Save results (CSV + Excel)
+    # -----------------------------
+    # Save the dfcx results as CSV (existing behavior)
+    results.to_csv(result_file, index=False)
+    print(f"Test completed. Accuracy (intent_match): {accuracy:.2f}%")
+
+    # Save updated Excel copy with two final columns populated
+    df.to_excel(results_excel_file, index=False, engine='openpyxl')
+    print(f"Results Excel written to: {results_excel_file}")
+
+if __name__ == "__main__":
+    main()
