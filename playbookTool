@@ -1,0 +1,455 @@
+import uuid
+import time
+import pandas as pd
+import configparser
+import ast
+import json
+import re
+import numpy as np
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from google.cloud import dialogflowcx_v3beta1 as dialogflow
+from google.protobuf.json_format import MessageToDict
+from google.api_core.exceptions import GoogleAPICallError
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# =============================================================================
+# KEY DIFFERENCES vs Flow workstream
+# =============================================================================
+# FLOW workstream:                  PLAYBOOK workstream:
+# ─────────────────────────────── ────────────────────────────────────────────
+# DialogflowConversation (scrapi) → google-cloud-dialogflow-cx SDK (v3beta1)
+# flow_display_name required      → NOT used; playbook is selected by the agent
+# page_display_name required      → NOT used
+# run_intent_detection()          → detect_intent() called per utterance
+# response.detected_intent        → response.current_playbook (playbook name)
+# response.confidence             → NOT returned for playbooks (LLM-based)
+# response.parameters_set         → response.parameters (session params dict)
+# =============================================================================
+
+
+# ─── Helpers (same as your flow workstream) ───────────────────────────────────
+def parse_params_maybe_dict(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if s == "":
+            return None
+        try:
+            d = json.loads(s)
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+        try:
+            d = ast.literal_eval(s)
+            if isinstance(d, dict):
+                return d
+        except (ValueError, SyntaxError):
+            return None
+    return None
+
+
+def normalize_text(x):
+    """Lowercase, trim, remove spaces. Returns None for nulls."""
+    if x is None:
+        return None
+    return str(x).strip().lower().replace(" ", "")
+
+
+def normalize_entity_value(v, digits_only=True):
+    if v is None:
+        return ""
+    if isinstance(v, (list, tuple)):
+        v = "".join(str(x) for x in v)
+    s = str(v)
+    s = re.sub(r"\s+", "", s)
+    if digits_only:
+        s = re.sub(r"\D+", "", s)
+    return s
+
+
+def ensure_text(x):
+    if x is None:
+        return ""
+    if not isinstance(x, str):
+        x = str(x)
+    return x.strip()
+
+
+# ─── Playbook detect_intent (single utterance) ────────────────────────────────
+def detect_intent_playbook(
+    project_id: str,
+    location: str,
+    agent_id: str,
+    utterance: str,
+    language_code: str = "en",
+    timeout: int = 60,
+) -> dict:
+    """
+    Call Dialogflow CX detectIntent for a PLAYBOOK agent.
+
+    Returns a dict with:
+        current_playbook  - display name of the playbook that handled the turn
+        response_text     - text response from the agent
+        parameters        - session parameters dict returned
+        raw_response      - full MessageToDict of QueryResult (for debugging)
+        error             - error string or ""
+
+    NOTE: Playbooks are LLM-driven and do NOT return:
+        - detected_intent  (there is no NLU intent matching in playbooks)
+        - confidence score (LLM routing has no confidence value)
+    Instead, we capture `current_playbook` to know which playbook handled the turn.
+    """
+    # v3beta1 is required for playbook features
+    api_endpoint = (
+        "dialogflow.googleapis.com:443"
+        if location == "global"
+        else f"{location}-dialogflow.googleapis.com:443"
+    )
+    client_options = {"api_endpoint": api_endpoint}
+    client = dialogflow.SessionsClient(client_options=client_options)
+
+    # Each utterance gets its own session to avoid context contamination
+    session_id = str(uuid.uuid4())
+    session_path = client.session_path(project_id, location, agent_id, session_id)
+
+    text_input = dialogflow.TextInput(text=utterance)
+    query_input = dialogflow.QueryInput(
+        text=text_input,
+        language_code=language_code,
+    )
+    request = dialogflow.DetectIntentRequest(
+        session=session_path,
+        query_input=query_input,
+    )
+
+    try:
+        response = client.detect_intent(request=request, timeout=timeout)
+        qr = response.query_result
+
+        # ── current_playbook ──────────────────────────────────────────────────
+        # For playbook agents, qr.current_playbook holds the resource name of
+        # the playbook that handled the turn, e.g.:
+        #   projects/.../agents/.../playbooks/<playbook_id>
+        # We extract just the display name from the resource path.
+        current_playbook_resource = ""
+        current_playbook_name = ""
+        if hasattr(qr, "current_playbook") and qr.current_playbook:
+            current_playbook_resource = qr.current_playbook
+            # Extract playbook ID (last segment of resource path)
+            current_playbook_name = current_playbook_resource.split("/")[-1]
+
+        # ── response text ─────────────────────────────────────────────────────
+        response_texts = []
+        for msg in qr.response_messages:
+            if msg.text.text:
+                response_texts.extend(msg.text.text)
+
+        # ── parameters (session params) ───────────────────────────────────────
+        params_dict = {}
+        if qr.parameters:
+            params_dict = MessageToDict(qr.parameters._pb)
+
+        # ── full raw result for diagnostics ───────────────────────────────────
+        try:
+            raw = MessageToDict(qr._pb)
+        except Exception:
+            raw = {}
+
+        return {
+            "current_playbook": current_playbook_name,
+            "current_playbook_resource": current_playbook_resource,
+            "response_text": " | ".join(response_texts),
+            "parameters": params_dict,
+            "raw_response": json.dumps(raw),
+            "error": "",
+        }
+
+    except GoogleAPICallError as e:
+        log.warning(f"API error for '{utterance}': {e.message}")
+        return {
+            "current_playbook": "",
+            "current_playbook_resource": "",
+            "response_text": "",
+            "parameters": {},
+            "raw_response": "",
+            "error": str(e.message),
+        }
+    except Exception as e:
+        log.warning(f"Unexpected error for '{utterance}': {e}")
+        return {
+            "current_playbook": "",
+            "current_playbook_resource": "",
+            "response_text": "",
+            "parameters": {},
+            "raw_response": "",
+            "error": str(e),
+        }
+
+
+# ─── Entity extraction (same DoB logic as your flow workstream) ───────────────
+def extract_dob_from_params(params: dict):
+    """
+    Replicate your flow workstream's DoB extraction logic.
+    Looks for 'extracted_dob' key with 'month', 'day', 'year' sub-keys.
+    Returns formatted string "M{01-12}DD{YYYY}" or None.
+    """
+    if not isinstance(params, dict):
+        return None
+    dob = params.get("extracted_dob")
+    if not dob:
+        return None
+    if not all(k in dob for k in ("month", "day", "year")):
+        return None
+    try:
+        month = str(int(dob["month"]))          # no leading zero on month
+        day = str(dob["day"]).zfill(2)          # 2-digit day
+        year = str(dob["year"])                 # 4-digit year
+        return f"{month}{day}{year}"
+    except Exception:
+        return None
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    # ── Step 1: Load config ───────────────────────────────────────────────────
+    config = configparser.ConfigParser()
+    config.read("config.properties")
+
+    # ── Step 2: Read config values ────────────────────────────────────────────
+    agent_id  = config.get("dialogflow", "agent_id")
+    # agent_id format: projects/<proj>/locations/<loc>/agents/<agent_uuid>
+    # We parse project and location from it.
+    parts = agent_id.split("/")
+    # Expected: ['projects', '<proj>', 'locations', '<loc>', 'agents', '<uuid>']
+    project_id = parts[1]
+    location   = parts[3]
+
+    excel_file        = config.get("input", "excel_file")
+    sheet_name        = config.getint("input", "sheet_name")
+    # NOTE: flow workstream used flow_display_name / page_display_name — NOT needed for playbooks
+    utterances_col    = config.get("input", "Utterances")
+    intent_column     = config.get("input", "intent_column")
+    # For playbook: intent_column now holds the EXPECTED PLAYBOOK NAME
+    # (rename the config key if you prefer, but keeping the same key avoids changes)
+
+    language_code     = config.get("input", "language_code", fallback="en")
+    max_workers       = config.getint("input", "max_workers", fallback=5)
+    request_delay_ms  = config.getint("input", "request_delay_ms", fallback=200)
+
+    result_file        = config.get("output", "result_file")
+    results_excel_file = (
+        config.get("output", "results_excel_file")
+        if config.has_option("output", "results_excel_file")
+        else "Playbook_Results.xlsx"
+    )
+
+    # ── Step 3: Read input Excel ──────────────────────────────────────────────
+    df = pd.read_excel(excel_file, sheet_name=sheet_name, engine="openpyxl")
+
+    for col in [utterances_col, intent_column]:
+        if col not in df.columns:
+            raise ValueError(
+                f"Column '{col}' not found in sheet '{sheet_name}' of '{excel_file}'."
+            )
+
+    df[utterances_col] = (
+        df[utterances_col]
+        .replace({"nan": ""})
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    df = df[df[utterances_col] != ""].reset_index(drop=True)
+
+    utterances = df[utterances_col].apply(ensure_text).tolist()
+    expected_playbooks = df[intent_column].astype(str).str.strip().tolist()
+
+    log.info(f"Loaded {len(utterances)} utterances from {excel_file}")
+    log.info(f"Agent: {agent_id}")
+    log.info(f"Location: {location} | Language: {language_code} | Workers: {max_workers}")
+
+    # ── Step 4: Run batch detect_intent in parallel ───────────────────────────
+    results_list = [None] * len(utterances)
+
+    def test_one(idx):
+        time.sleep(idx * request_delay_ms / 1000 / max_workers)  # stagger requests
+        utt = utterances[idx]
+        log.info(f"[{idx + 1}/{len(utterances)}] Testing: '{utt}'")
+        result = detect_intent_playbook(
+            project_id=project_id,
+            location=location,
+            agent_id=agent_id,
+            utterance=utt,
+            language_code=language_code,
+        )
+        return idx, result
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(test_one, i): i for i in range(len(utterances))}
+        for future in as_completed(futures):
+            idx, result = future.result()
+            results_list[idx] = result
+
+    # ── Step 5: Build results DataFrame ──────────────────────────────────────
+    rows = []
+    for idx, result in enumerate(results_list):
+        utt      = utterances[idx]
+        expected = expected_playbooks[idx]
+
+        current_pb = result["current_playbook"]
+
+        # ── Playbook match (replaces intent_match from flow workstream) ───────
+        # Playbooks don't have confidence scores, so we match purely on name.
+        # We do a normalized string compare (same normalize_text as your flow code).
+        playbook_match = (
+            normalize_text(expected) == normalize_text(current_pb)
+            if expected.strip() and current_pb.strip()
+            else False
+        )
+        pass_fail = "PASS" if playbook_match else ("N/A" if not expected.strip() else "FAIL")
+
+        # ── Entity / DoB extraction (same logic as your flow workstream) ──────
+        params   = result["parameters"]
+        extracted_dob = extract_dob_from_params(params)
+
+        # Entity match: compare extracted DoB vs expected (same as your flow code)
+        entity_match = False
+        if extracted_dob and expected.strip():
+            entity_match = (normalize_text(extracted_dob) == normalize_text(expected))
+
+        rows.append({
+            "utterance":                utt,
+            "expected_playbook":        expected,
+            "current_playbook":         current_pb,
+            "playbook_match":           pass_fail,
+            # NOTE: no confidence for playbooks (LLM-based routing)
+            "confidence":               "N/A (LLM-based)",
+            "extracted_entity":         extracted_dob or "",
+            "entity_match":             "PASS" if entity_match else ("N/A" if not extracted_dob else "FAIL"),
+            "response_text":            result["response_text"],
+            "parameters_json":          json.dumps(params) if params else "",
+            "error":                    result["error"],
+            # Keep raw_response for debugging but put it last
+            "raw_response":             result["raw_response"],
+        })
+
+    results = pd.DataFrame(rows)
+
+    # ── Step 6: Stats ─────────────────────────────────────────────────────────
+    total     = len(results)
+    pass_c    = (results["playbook_match"] == "PASS").sum()
+    fail_c    = (results["playbook_match"] == "FAIL").sum()
+    na_c      = (results["playbook_match"] == "N/A").sum()
+    err_c     = results["error"].str.strip().ne("").sum()
+    pass_rate = round(pass_c / (pass_c + fail_c) * 100, 2) if (pass_c + fail_c) > 0 else 0
+
+    log.info("\n" + "=" * 60)
+    log.info("  PLAYBOOK TEST RESULTS")
+    log.info(f"  Total Utterances : {total}")
+    log.info(f"  PASS             : {pass_c}")
+    log.info(f"  FAIL             : {fail_c}")
+    log.info(f"  N/A              : {na_c}")
+    log.info(f"  API Errors       : {err_c}")
+    log.info(f"  Pass Rate        : {pass_rate}%")
+    log.info("=" * 60)
+
+    # ── Step 7: Write back to original input Excel schema ────────────────────
+    # (mirrors your flow workstream's df write-back pattern)
+    if "Actual DoB" not in df.columns:
+        df["Actual DoB"] = ""
+    if "Pass / Fail" not in df.columns:
+        df["Pass / Fail"] = ""
+    if "Matched Playbook" not in df.columns:
+        df["Matched Playbook"] = ""
+
+    df["Actual DoB"]      = results["extracted_entity"].values
+    df["Pass / Fail"]     = results["playbook_match"].values
+    df["Matched Playbook"] = results["current_playbook"].values
+
+    # ── Step 8: Save CSV (full results) + Excel (annotated input + summary) ──
+    results.to_csv(result_file, index=False)
+    log.info(f"Full results CSV saved: {result_file}")
+
+    # Multi-sheet Excel report
+    from openpyxl import load_workbook
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+
+    PASS_FILL   = PatternFill("solid", fgColor="C6EFCE")
+    FAIL_FILL   = PatternFill("solid", fgColor="FFC7CE")
+    NA_FILL     = PatternFill("solid", fgColor="FFEB9C")
+    HDR_FILL    = PatternFill("solid", fgColor="2E4057")
+    HDR_FONT    = Font(color="FFFFFF", bold=True)
+    THIN_BORDER = Border(*[Side(style="thin")] * 0,
+                         left=Side(style="thin"), right=Side(style="thin"),
+                         top=Side(style="thin"), bottom=Side(style="thin"))
+
+    summary_data = {
+        "Metric": ["Total Utterances", "PASS", "FAIL", "N/A", "API Errors", "Pass Rate (%)"],
+        "Value":  [total, pass_c, fail_c, na_c, err_c, f"{pass_rate}%"],
+    }
+
+    with pd.ExcelWriter(results_excel_file, engine="openpyxl") as writer:
+        results.drop(columns=["raw_response"], errors="ignore").to_excel(
+            writer, sheet_name="All Results", index=False
+        )
+        df.to_excel(writer, sheet_name="Annotated Input", index=False)
+        pd.DataFrame(summary_data).to_excel(writer, sheet_name="Summary", index=False)
+        failures = results[results["playbook_match"] == "FAIL"]
+        if not failures.empty:
+            failures.drop(columns=["raw_response"], errors="ignore").to_excel(
+                writer, sheet_name="Failures", index=False
+            )
+        errors = results[results["error"].str.strip() != ""]
+        if not errors.empty:
+            errors.drop(columns=["raw_response"], errors="ignore").to_excel(
+                writer, sheet_name="API Errors", index=False
+            )
+
+    # Color-code the workbook
+    wb = load_workbook(results_excel_file)
+    for sheet_title in ["All Results", "Failures"]:
+        if sheet_title not in wb.sheetnames:
+            continue
+        ws = wb[sheet_title]
+        for cell in ws[1]:
+            cell.fill = HDR_FILL
+            cell.font = HDR_FONT
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+        ws.freeze_panes = "A2"
+
+        pf_col = None
+        for cell in ws[1]:
+            if str(cell.value) in ("playbook_match", "entity_match"):
+                pf_col = cell.column
+                break
+        if pf_col:
+            for row in ws.iter_rows(min_row=2, min_col=pf_col, max_col=pf_col):
+                for cell in row:
+                    if cell.value == "PASS":
+                        cell.fill = PASS_FILL
+                        cell.font = Font(bold=True, color="276221")
+                    elif cell.value == "FAIL":
+                        cell.fill = FAIL_FILL
+                        cell.font = Font(bold=True, color="9C0006")
+                    elif cell.value == "N/A":
+                        cell.fill = NA_FILL
+
+    wb.save(results_excel_file)
+    log.info(f"Results Excel written: {results_excel_file}")
+    log.info("Done ✅")
+
+
+if __name__ == "__main__":
+    main()
