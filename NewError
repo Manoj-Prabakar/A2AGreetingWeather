@@ -1,0 +1,4 @@
+ "Session ID must be provided in the following format: "
+                "`projects/<Project ID>/locations/<Location ID>/agents/"
+                "<Agent ID>/sessions/<Session ID>`.\n\n"
+                "Utilize `build_session_id` to create a new Session ID."
