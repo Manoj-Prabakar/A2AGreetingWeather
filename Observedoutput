@@ -1,0 +1,29 @@
+webhookStatuses: [{}, {'code': 3, 'message': "Error calling webhook 'https://api-stg.uhg.com/api/cloud/applications/contact-center-conver
+  match: {'intent': {'name': 'projects/aphmoojo-3bbf-tayr-6x95-uz4byo/locations/us-central1/agents/1c677158-dbf9-4b56-ba6a-f745f4 
+  advancedSettings: {'loggingSettings': {'enableStackdriverLogging': True, 'enableInteractionLogging': True}}
+  webhookIds: ['aa00d061-3308-4123-af92-47250b046562', 'fa9e4294-d48c-4eb7-af3d-541a38101824']
+  webhookDisplayNames: ['Get Config', 'Patch And Get Context']
+  webhookLatencies: ['0.474s', '0.099s']
+  webhookTags: ['getconfig', 'patchAndGetContext']
+  currentFlow: {'name': 'projects/aphmoojo-3bbf-tayr-6x95-uz4byo/locations/us-central1/agents/1c677158-dbf9-4b56-ba6a-f745f4095efc/flow
+  generativeInfo: {'actionTracingInfo': {'name': 'projects/aphmoojo-3bbf-tayr-6x95-uz4byo/locations/us-central1/agents/1c677158-dbf9-4b56-
+
+============================================================
+  DIRECT ATTRIBUTE ACCESS on response.query_result
+============================================================
+  qr.current_playbook: NOT FOUND
+  qr.response_messages: [text {
+  text: " Sure. Let me help you with that. "
+}
+, payload {
+  fields {
+    key: "activities"
+    value {
+      list_value {
+        values {
+
+  qr.parameters: <proto.marshal.collections.maps.MapComposite object at 0x0000022E7449C380>
+  qr.diagnostic_info: <proto.marshal.collections.maps.MapComposite object at 0x0000022E7449C410>
+
+============================================================
+  DONE — Share output above so we can fix current_playbook field
