@@ -1,0 +1,6 @@
+xl          = pd.ExcelFile(excel_file, engine="openpyxl")
+all_sheets  = xl.sheet_names
+start_sheet = config.getint("input", "start_sheet", fallback=0)
+end_sheet   = config.getint("input", "end_sheet",   fallback=len(all_sheets) - 1)
+sheet_names = all_sheets[start_sheet: end_sheet + 1]
+print(f"Total sheets: {len(all_sheets)} | Processing sheets {start_sheet} to {end_sheet}: {sheet_names}")
